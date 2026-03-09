@@ -43,11 +43,25 @@ Trim it tight, keep resolution and framerate sane (720p, 15-30fps is plenty for 
 
 The natural workflow is escalation: run the cheap screenshot pass first, and if something looks off or the change involves interaction/animation, trigger targeted video clips to evaluate the motion.
 
+## Not Just Browsers
+
+This works at the **screen level**, not the browser level. Any visual application benefits:
+
+- Web apps (React, Vue, Svelte — via dev server)
+- Desktop apps (Tauri, Electron, native)
+- Mobile emulators
+- Terminal UIs
+- Design tools (Figma, etc.)
+- Game engines
+
+Playwright-based tools are limited to headless browser capture. AgentVisual captures the actual window on screen — whatever the application, whatever the framework.
+
 ## What This Is NOT
 
 - Not a pixel-diff regression framework (Playwright/Cypress do that)
 - Not continuous screen recording (too expensive, too noisy)
 - Not a browser automation agent (Computer Use drives the mouse — this watches the result)
+- Not browser-only (screen-level capture works with any visual application)
 
 ## What This IS
 
@@ -104,10 +118,65 @@ An AI coding agent can:
 4. The agent fixes them without a human ever opening a browser
 5. The human only intervenes for design decisions — not for catching a div that pushes content around when clicked
 
-## Tech Stack (TBD)
+## Architecture
 
-- **Screen/window recording** — targeted capture of browser window during interactions
-- **Video encoding** — trim, compress, optimize for token efficiency
-- **Vision model API** — Claude, Gemini, or whatever handles video input best
-- **Orchestration** — trigger recordings, manage clips, feed to model, return results
-- **Integration** — hook into existing AI coding workflows
+### Existing Infrastructure
+
+AgentVisual builds on two sibling projects:
+
+**QuickShotter** (Tauri 2 + Rust) — already-built screen capture and recording tool:
+- Cross-platform window-targeted capture (not browser-only)
+- GPU-accelerated H.264 encoding (Media Foundation on Windows, VideoToolbox on macOS, openh264 fallback)
+- Multi-monitor DPI-aware screenshot stitching
+- Configurable FPS (10/15/24/30) — perfect for token-efficient low-framerate clips
+- Two-thread recording pipeline (capture thread + encoder thread with backpressure)
+- Window detection worker thread (knows which window to capture)
+- Region recording — select area before recording starts
+- MP4 + GIF output
+
+**overtooled-mcp** (TypeScript) — MCP server pattern and image processing:
+- Clean MCP tool registration pattern (stdio transport, @modelcontextprotocol SDK)
+- Image processing via sharp (resize, compress, format conversion)
+- File analysis (dimensions, metadata, format detection)
+- Reference for how to expose tools to Claude Code
+
+### System Design
+
+```
+AgentVisual MCP Server (TypeScript — orchestration + vision API)
+  │
+  ├── MCP Tools (exposed to Claude Code / coding agents)
+  │     - screenshot(window, breakpoints[])
+  │     - record(window, interaction, duration)
+  │     - evaluate(captures[], criteria)
+  │
+  ├── Capture Engine (Rust binary — extracted/adapted from QuickShotter)
+  │     - Window-targeted screen capture (any app, not just browsers)
+  │     - GPU-accelerated H.264 recording for short clips
+  │     - DPI-aware screenshots
+  │     - Configurable FPS/resolution for token efficiency
+  │     - Start/stop recording on command via CLI or IPC
+  │
+  ├── Image Processing (sharp — from overtooled-mcp patterns)
+  │     - Resize/compress screenshots before sending to vision model
+  │     - Optimize for minimum token cost
+  │
+  └── Vision Evaluation (Gemini API — native video input)
+        - Send clips + screenshots with structured evaluation prompts
+        - Return timestamped observations for video, annotated findings for stills
+        - Gemini 2.5 Pro for video, Flash for cost-sensitive screenshot passes
+```
+
+### Why This Split
+
+- **Rust for capture** — screen recording needs native OS APIs, GPU encoding, low-level performance. QuickShotter already solved this.
+- **TypeScript for orchestration** — MCP SDK is TypeScript, vision API calls are HTTP, prompt engineering is text manipulation. No need for Rust here.
+- **Gemini for evaluation** — only major model with native video input. Claude for screenshot evaluation as an option (strong image reasoning, cheaper).
+
+### Tech Stack
+
+- **Capture engine**: Rust (xcap + Media Foundation/VideoToolbox) — derived from QuickShotter
+- **MCP server**: TypeScript (@modelcontextprotocol SDK) — pattern from overtooled-mcp
+- **Image processing**: sharp (resize/compress captures)
+- **Vision model**: Gemini 2.5 Pro/Flash (video), optionally Claude (screenshots)
+- **Integration**: MCP server consumed by Claude Code, Cursor, or any MCP-compatible agent
