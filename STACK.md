@@ -1,0 +1,343 @@
+# AgentVisual — Stack & Foundation
+
+Every dependency listed here is intentional. If it's not on this list, it doesn't go in the project without a reason.
+
+---
+
+## Two-Binary Architecture
+
+AgentVisual is two separate programs that talk to each other:
+
+1. **`agentvisual`** — TypeScript MCP server. Handles tool registration, orchestration, vision API calls, image optimization, and structured output. This is what coding agents connect to.
+
+2. **`agentvisual-capture`** — Rust CLI binary. Handles screen capture and video recording. Invoked by the MCP server as a child process. Does one thing well: turn pixels on screen into files on disk.
+
+They communicate through simple CLI invocation + file paths. No IPC protocol, no sockets, no shared memory. The TypeScript server calls the Rust binary with arguments, the binary writes a file, the server reads it.
+
+**Why two languages:**
+- Screen capture requires native OS APIs (Win32, CoreGraphics, X11) and GPU-accelerated encoding. This is Rust territory — it's already proven in QuickShotter.
+- MCP protocol, HTTP API calls, JSON manipulation, and prompt construction are all TypeScript strengths. The MCP SDK is TypeScript. No reason to fight that.
+
+---
+
+## Rust: Capture Engine
+
+### Language & Toolchain
+
+- **Rust 2021 edition**
+- **Cargo** for build/dependency management
+- Target: standalone CLI binary (no Tauri, no GUI framework)
+
+### Core Dependencies
+
+Carried over from QuickShotter — these are proven and tested:
+
+| Crate | Version | Purpose | Notes |
+|-------|---------|---------|-------|
+| `xcap` | 0.8 | Cross-platform screen capture | GDI/DXGI (Win), AVFoundation (Mac), X11/Wayland (Linux). Already used in QuickShotter. |
+| `image` | 0.25 | Image encoding (PNG, JPEG, WebP) | Default features disabled, only enable `png`, `jpeg`, `webp`. |
+| `openh264` | 0.6 | Software H.264 fallback encoder | CPU fallback when GPU encoding unavailable. |
+| `crossbeam-channel` | 0.5 | Thread-safe channel for capture/encoder pipeline | Bounded buffer between capture thread and encoder thread. |
+| `gif` | 0.13 | GIF encoding | For GIF output mode (lower priority). |
+| `color_quant` | 1.1 | Color quantization for GIF | Palette reduction. |
+| `serde` | 1 | JSON serialization | For structured CLI output (window list, capture metadata). |
+| `serde_json` | 1 | JSON formatting | CLI output format. |
+| `chrono` | 0.4 | Timestamps | Filename generation, metadata. |
+| `thiserror` | 2 | Error types | Clean error handling. |
+
+### Platform-Specific Dependencies
+
+| Crate | Version | Platform | Purpose |
+|-------|---------|----------|---------|
+| `windows` | 0.62 | Windows | Media Foundation H.264 GPU encoding (NVENC/AMF/QuickSync). Features: `Win32_Media_MediaFoundation`, `Win32_System_Com`, `Win32_Foundation`. |
+
+macOS VideoToolbox encoding uses Objective-C FFI bridge (compiled via `cc` build dependency) — no additional crate needed.
+
+### New Dependencies (Not in QuickShotter)
+
+| Crate | Purpose | Notes |
+|-------|---------|-------|
+| `clap` | CLI argument parsing | QuickShotter used Tauri IPC. AgentVisual needs a proper CLI. **TBD: version — likely 4.x** |
+
+### Removed from QuickShotter
+
+These were GUI/app-specific and don't belong in a headless capture binary:
+
+- `tauri` and all `tauri-plugin-*` crates
+- `arboard` (clipboard — not needed for file output)
+- `base64` (was for IPC image transfer to frontend)
+- `mouse_position` (was for overlay interaction)
+- `dirs` (was for user-facing save paths)
+
+### Build Configuration
+
+```toml
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+Carried from QuickShotter — image encoding and video processing are unusable at debug optimization levels.
+
+### Project Structure (Rust)
+
+```
+capture/
+├── Cargo.toml
+├── src/
+│   ├── main.rs              CLI entry point (clap)
+│   ├── capture.rs           Screenshot capture, DPI handling
+│   ├── window.rs            Window detection and targeting
+│   ├── recording/
+│   │   ├── mod.rs
+│   │   ├── pipeline.rs      Two-thread capture/encode pipeline
+│   │   ├── encoder.rs       VideoEncoder trait, FallbackEncoder
+│   │   ├── encoder_win.rs   Media Foundation (Windows)
+│   │   ├── encoder_mac.rs   VideoToolbox (macOS)
+│   │   ├── encoder_cpu.rs   openh264 fallback
+│   │   ├── mp4_muxer.rs     MP4 container writer
+│   │   └── gif_encoder.rs   GIF output
+│   └── error.rs             Unified error types
+└── build.rs                 macOS Objective-C compilation (cc)
+```
+
+### CLI Interface
+
+```
+agentvisual-capture screenshot --window <title|pid> [--output path.png] [--scale 0.5]
+agentvisual-capture record --window <title|pid> --duration <seconds> [--fps 15] [--output path.mp4] [--scale 0.5]
+agentvisual-capture list-windows [--json]
+```
+
+All output defaults to a temp directory. JSON output on stdout for metadata (dimensions, file path, duration, etc.).
+
+---
+
+## TypeScript: MCP Server
+
+### Runtime & Toolchain
+
+- **Node.js >= 18** (LTS baseline, matches overtooled-mcp)
+- **TypeScript 5.5+** (strict mode, ES2022 target)
+- **ESM only** (`"type": "module"` in package.json)
+- **Vitest** for testing
+
+### Core Dependencies
+
+| Package | Version | Purpose | Notes |
+|---------|---------|---------|-------|
+| `@modelcontextprotocol/sdk` | ^1.27.0 | MCP server framework | Stdio transport. Same version as overtooled-mcp. |
+| `zod` | ^3.23.0 | Input validation | Schema validation for tool parameters. |
+| `sharp` | ^0.33.0 | Image processing | Resize/compress screenshots before sending to vision API. Proven in overtooled-mcp. |
+
+### Vision API Client
+
+| Package | Version | Purpose | Notes |
+|---------|---------|---------|-------|
+| `@google/generative-ai` | **TBD** | Gemini API client | Official Google SDK for Gemini. Handles video + image input natively. **Need to verify current version and video input support.** |
+
+**TBD: Gemini SDK specifics:**
+- Does `@google/generative-ai` support video file upload directly, or does it need to go through the File API first?
+- What's the max video duration/size for a single API call?
+- Is there a streaming response option for faster feedback on larger evaluations?
+
+**TBD: Multi-model support:**
+- Should we abstract the vision API behind an interface to support Claude (images) and Gemini (video) interchangeably?
+- Or start Gemini-only and add others later?
+
+### Dev Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `typescript` | ^5.5.0 | Compiler |
+| `vitest` | ^2.0.0 | Testing |
+| `@types/node` | ^20 | Node.js type definitions |
+
+### Intentionally NOT Including
+
+| Package | Why Not |
+|---------|---------|
+| `ffmpeg-static` / `ffprobe-static` | Video recording handled by Rust binary, not Node. |
+| `puppeteer` / `playwright` | Not a browser automation tool. Screen-level capture via Rust. |
+| `canvas` | No server-side rendering. We capture what's already on screen. |
+| `express` / `fastify` | MCP uses stdio transport, no HTTP server needed. |
+| `pdfkit` / `pdfjs-dist` | No document processing. |
+
+### Project Structure (TypeScript)
+
+```
+server/
+├── package.json
+├── tsconfig.json
+├── vitest.config.ts
+├── bin/
+│   └── agentvisual.ts          MCP server entry point
+├── src/
+│   ├── index.ts                Public exports
+│   ├── server.ts               Tool registration
+│   ├── tools/
+│   │   ├── screenshot.ts       screenshot() tool handler
+│   │   ├── record.ts           record() tool handler
+│   │   └── evaluate.ts         evaluate() tool handler
+│   ├── capture/
+│   │   └── bridge.ts           Spawns Rust binary, parses output
+│   ├── vision/
+│   │   ├── client.ts           Gemini API client wrapper
+│   │   ├── prompts.ts          Evaluation prompt templates
+│   │   └── types.ts            EvaluationResult, Issue, etc.
+│   ├── processing/
+│   │   └── optimize.ts         Sharp-based image optimization before API
+│   └── config.ts               Runtime config, env vars, defaults
+└── __tests__/
+```
+
+---
+
+## Monorepo Structure
+
+Both components live in one repository:
+
+```
+AgentVisual/
+├── MISSION.md
+├── TECHNICAL.md
+├── STACK.md                  (this file)
+├── capture/                  Rust CLI binary
+│   ├── Cargo.toml
+│   └── src/
+└── server/                   TypeScript MCP server
+    ├── package.json
+    └── src/
+```
+
+**TBD: Monorepo tooling:**
+- Do we need a workspace-level build script that builds both?
+- Or keep them independent — `cd capture && cargo build` / `cd server && npm run build`?
+- How does the TypeScript server locate the Rust binary? Bundled? Expect it on PATH? Configurable path in env?
+
+---
+
+## Configuration
+
+### Environment Variables
+
+```
+GEMINI_API_KEY          — Required. Gemini API authentication.
+AGENTVISUAL_CAPTURE_BIN — Optional. Path to Rust binary. Defaults to looking on PATH.
+AGENTVISUAL_TEMP_DIR    — Optional. Where to save captures. Defaults to OS temp directory.
+AGENTVISUAL_MODEL       — Optional. Override vision model. Defaults to "gemini-2.5-flash".
+AGENTVISUAL_LOG_LEVEL   — Optional. "debug" | "info" | "warn" | "error". Defaults to "info".
+```
+
+### Project-Level Config (`.agentvisual.json`)
+
+Optional file in project root for project-specific defaults:
+
+```json
+{
+  "window": "My App - localhost:5173",
+  "breakpoints": [320, 768, 1024, 1440],
+  "video": {
+    "fps": 15,
+    "maxDuration": 5,
+    "scale": 0.5
+  },
+  "model": "gemini-2.5-pro"
+}
+```
+
+**TBD:** Is this needed for MVP, or is it Phase 3 refinement?
+
+---
+
+## Build & Distribution
+
+### Rust Binary
+
+```bash
+cd capture
+cargo build --release
+```
+
+Produces a single static binary. No runtime dependencies (openh264 is compiled in, GPU encoders use OS-provided libraries).
+
+**Cross-compilation targets:**
+- `x86_64-pc-windows-msvc` (Windows)
+- `aarch64-apple-darwin` (macOS Apple Silicon)
+- `x86_64-apple-darwin` (macOS Intel)
+- `x86_64-unknown-linux-gnu` (Linux)
+
+### TypeScript MCP Server
+
+```bash
+cd server
+npm install
+npm run build
+```
+
+**Distribution options (TBD):**
+- `npx agentvisual` — like overtooled-mcp, published to npm
+- But the Rust binary needs to come from somewhere. Options:
+  1. Ship prebuilt binaries as npm optionalDependencies (platform-specific packages, like `esbuild` does)
+  2. Expect user to build from source or download binary separately
+  3. GitHub Releases with platform binaries, npm package downloads on first run
+
+**TBD:** This is a significant distribution decision. Option 1 is the smoothest UX but most complex to set up. Option 2 is simplest but highest friction. Option 3 is a middle ground.
+
+---
+
+## Testing Strategy
+
+### Rust
+
+- Unit tests for image encoding, CLI argument parsing, JSON output format
+- Integration tests that capture a known window and verify output file
+- **No GPU encoder tests in CI** — GPU availability varies. Test the fallback (openh264) in CI, GPU encoding manually.
+
+### TypeScript
+
+- Unit tests for prompt construction, output parsing, image optimization
+- Mock the Rust binary for tool handler tests
+- Mock the Gemini API for evaluation tests
+- Integration tests that run the full MCP server with mock capture + mock vision
+
+### What NOT to Test
+
+- Don't test `xcap` internals (OS screen capture APIs)
+- Don't test `sharp` internals (image processing library)
+- Don't test Gemini API behavior (external service)
+- Test the glue, the prompts, the output parsing, and the orchestration
+
+---
+
+## Foundation Priority
+
+What to build first, in order. Each layer is usable before the next one starts:
+
+### Layer 1: Rust CLI — Screenshots Only
+- `agentvisual-capture screenshot --window "title" --output path.png`
+- `agentvisual-capture list-windows --json`
+- Window targeting by title (exact and substring match)
+- PNG output with optional scale factor
+- JSON metadata on stdout
+
+### Layer 2: TypeScript MCP Server — Screenshot Tool
+- MCP server with `screenshot()` tool
+- Spawns Rust binary, collects output
+- Sharp compression/resize of captures
+- Gemini Flash API call with screenshot evaluation prompt
+- Returns structured JSON findings
+
+### Layer 3: Rust CLI — Video Recording
+- `agentvisual-capture record --window "title" --duration 2s --fps 15 --output path.mp4`
+- GPU-accelerated H.264 with CPU fallback
+- Two-thread pipeline from QuickShotter
+
+### Layer 4: TypeScript MCP Server — Video Tool
+- MCP `record()` tool
+- Gemini Pro API call with video evaluation prompt
+- Timestamped observations in response
+
+### Layer 5: Evaluate Tool & Refinement
+- `evaluate()` tool for re-running vision on existing captures
+- Project config file support
+- Prompt tuning based on real usage
