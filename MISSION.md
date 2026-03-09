@@ -1,95 +1,103 @@
-# Visual QA Loop
+# AgentVisual
 
 ## Mission
 
-Eliminate the human visual debugging bottleneck in AI-assisted frontend development.
-
-When an LLM writes UI code, the human currently serves as the eyes — screenshot, describe the problem, feed it back. This project closes that loop automatically: the AI writes code, sees the rendered result, evaluates it visually, and self-corrects — without a human ever looking at the screen.
+Give AI coding agents video-based visual perception of their own UI output — not screenshots, not pixel diffs, but actual video of the interface in motion — so they can catch the problems that only reveal themselves through interaction and movement.
 
 ## The Problem
 
-AI coding assistants are blind. They can write CSS, generate layouts, build responsive UIs — but they have no idea what the result actually looks like. Every visual bug requires a human to:
+AI coding assistants are blind. They write CSS, build layouts, wire up animations — and have zero idea what any of it actually looks like. The current workaround is the human: you look at the screen, notice something's off, screenshot it, describe it, feed it back. You are the visual cortex.
 
-1. Notice it
-2. Screenshot or describe it
-3. Relay it back to the AI
-4. Wait for a fix
-5. Check again
+Screenshots help, but they miss an entire class of bugs that only exist in motion:
 
-This is the slowest part of the AI-assisted frontend workflow. The code loop is fast (write, run tests, fix). The visual loop is manual and tedious.
+- Layout shifting when a button is clicked
+- Content pushing down on state change
+- Janky resize behavior between breakpoints
+- Hover/focus transitions that feel wrong
+- Scroll-triggered layout breaks
+- Modal open/close causing reflow
+- Animation timing that looks off
+
+These are **temporal, interaction-driven problems**. A static image can't capture them. You need to see the thing *move*.
 
 ## The Solution
 
-An automated visual QA system that gives the AI eyes on its own output:
+Short, targeted video recordings of UI interactions, fed to a vision-capable LLM for evaluation.
 
-- **After a code change**, automatically render the result in a headless browser
-- **At multiple breakpoints** (320px, 768px, 1024px, 1440px)
-- **Through interactive states** (click buttons, open modals, hover, scroll, type in inputs)
-- **Capture each state** and feed it to a vision model
-- **Evaluate against criteria**: alignment, spacing, overflow, reflow, visual hierarchy, interaction side effects (content pushing, layout shifts)
-- **Self-correct** or report findings — then loop until clean
+Not continuous screen recording. Not a stream. **Precise clips** — record only the window of time needed to capture the interaction being tested:
+
+- Resize from 1440px down to 320px over 3 seconds — record that
+- Click a button that triggers a state change — record the 1-2 seconds around it
+- Open a modal, interact, close it — record that sequence
+- Scroll through a page — record the scroll
+
+Trim it tight, keep resolution and framerate sane (720p, 15-30fps is plenty for UI evaluation), and send the clip to a vision model that can watch it and say: "At 1.2 seconds, the sidebar collapses and pushes the main content down by 40px before snapping back. That's a layout shift bug."
 
 ## What This Is NOT
 
-- Not a screenshot transporter (Claude Code can already read screenshots)
-- Not a pixel-diff regression tool (Playwright/Cypress already do that)
-- Not a browser automation agent (Computer Use already drives mouse/keyboard)
-- Not continuous screen recording for LLMs (economically impractical, low signal-to-noise)
+- Not a screenshot tool (Claude Code already does that)
+- Not a pixel-diff regression framework (Playwright/Cypress do that)
+- Not continuous screen recording (too expensive, too noisy)
+- Not a browser automation agent (Computer Use drives the mouse — this watches the result)
 
 ## What This IS
 
-A **taste-aware visual judgment layer** that sits inside the AI coding loop. It answers questions that code analysis can't:
+A **video-based visual QA layer** for AI coding loops. The AI writes code, the UI renders, AgentVisual records targeted interaction clips, and the vision model evaluates what it sees — catching the temporal, motion-based problems that no amount of code reading or screenshot analysis can detect.
 
-- "Does this *look* right?"
-- "Does the layout break when resized?"
-- "Does clicking this button cause ugly reflow?"
-- "Is the spacing consistent with the rest of the page?"
-- "Does this modal clip on mobile?"
-
-## Key Differentiator
-
-Existing tools catch regressions against a known baseline. This catches **subjective visual issues** — things that are technically valid CSS but look wrong to a human. The vision model provides the judgment that automated pixel-diffing can't.
-
-## Core Architecture (Conceptual)
+## Core Concept
 
 ```
-Code change (from AI or human)
-  --> hot reload / rebuild
-  --> Playwright headless browser
-  --> scripted interaction sequences:
-        resize to each breakpoint --> capture
-        trigger interactive states --> capture
-        scroll through page       --> capture
-  --> batch screenshots to vision model
-  --> evaluate against:
-        - project style standards
-        - before/after comparison
-        - explicit criteria (no overflow, no reflow, consistent spacing)
-  --> output: pass / list of visual issues with descriptions
-  --> if integrated with coding AI: auto-fix and re-loop
+Code change (AI or human)
+  --> UI hot reloads
+  --> AgentVisual triggers targeted recordings:
+        record: resize from desktop to mobile (3s clip)
+        record: click primary action button (1s clip)
+        record: open/close modal (2s clip)
+        record: scroll full page (2s clip)
+        record: hover interactive elements (1s clip each)
+  --> trim clips tight, encode at 720p / 15-30fps
+  --> send to vision model with context:
+        "Watch this clip. Evaluate for layout shifts, reflow,
+         animation jank, overflow, clipping, or anything that
+         looks visually broken during the interaction."
+  --> model returns timestamped observations
+  --> feed back into coding loop for fixes
 ```
+
+## Cost Control
+
+Video tokens are expensive. The entire design is built around minimizing them:
+
+- **Short clips only** — 1-3 seconds per interaction, not minutes of footage
+- **Lower resolution** — 720p is sufficient for UI evaluation, maybe even 480p
+- **Reduced framerate** — 15fps captures motion without waste. No need for 60fps
+- **Targeted recording** — only record during the specific interaction being tested. Don't record idle time, typing, or reading
+- **Interaction-driven** — the system knows exactly when to start and stop recording based on what's being tested
+
+The goal is clips measured in seconds and megabytes, not minutes and gigabytes.
 
 ## Open Questions
 
-- **Taste calibration**: How does the AI learn what "correct" looks like for a specific project? Reference screenshots? Style guide docs? Feedback rounds?
-- **Integration model**: Standalone tool? VS Code extension? Claude Code hook? MCP server?
-- **Interaction scripting**: How much does the user need to define vs. how much can be inferred from the component tree?
-- **Cost**: Each QA pass = multiple screenshots to a vision API. What's the per-iteration cost and how to keep it sustainable?
-- **Scope**: Start with static layout QA? Or tackle animations/transitions from the start?
-
-## Tech Stack (Likely)
-
-- **Playwright** — headless browser, screenshot capture, interaction scripting
-- **Claude Vision API** — visual evaluation and judgment
-- **TypeScript/Node** — orchestration layer
-- **Integration target** — Claude Code hooks, MCP server, or VS Code extension
+1. **Taste calibration** — How does the model learn what "correct" looks like for a specific project? Reference clips of good behavior? Style guide? Feedback rounds?
+2. **Interaction scripting** — What triggers the recordings? Can it infer meaningful interactions from the component tree, or does the user define test sequences?
+3. **Temporal understanding** — Can current vision models reliably spot a 200ms layout shift in a video clip? How good is their frame-by-frame analysis?
+4. **Integration model** — Where does this live? MCP server? Claude Code hook? VS Code extension? Standalone tool?
+5. **Feedback format** — How does the model report issues back? Timestamped descriptions? Annotated frame grabs from the video? Directly mapped to source code?
 
 ## Success Criteria
 
-The project succeeds if an AI coding assistant can:
+An AI coding agent can:
 
-1. Make a CSS/layout change
-2. Automatically verify it looks correct across breakpoints and interaction states
-3. Catch and fix visual bugs without a human ever opening a browser
+1. Make a UI change
+2. AgentVisual automatically records targeted interaction clips
+3. The vision model watches the clips and identifies motion-based visual bugs
+4. The agent fixes them without a human ever opening a browser
+5. The human only intervenes for design decisions — not for catching a div that pushes content around when clicked
 
-The human should only need to intervene for genuine design decisions — not for catching a misaligned div.
+## Tech Stack (TBD)
+
+- **Screen/window recording** — targeted capture of browser window during interactions
+- **Video encoding** — trim, compress, optimize for token efficiency
+- **Vision model API** — Claude, Gemini, or whatever handles video input best
+- **Orchestration** — trigger recordings, manage clips, feed to model, return results
+- **Integration** — hook into existing AI coding workflows
