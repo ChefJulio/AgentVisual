@@ -120,29 +120,51 @@ QuickShotter is a Tauri GUI app. AgentVisual needs a **headless CLI binary** tha
 
 ### Evaluation Prompts
 
-The vision model needs structured prompts to produce actionable output. Rough structure:
+The vision model needs structured prompts to produce actionable output. Two principles drive prompt quality:
+
+**1. Tell it what changed.** Without context, the model evaluates everything generically and produces vague findings. With context about what the developer modified, it focuses on the area most likely to be broken.
+
+**2. Force structured JSON output.** Free-text evaluations are unreliable to parse and act on programmatically. JSON schema ensures the agent can reliably read and respond to findings.
 
 **For screenshots:**
 ```
 You are evaluating a UI screenshot for visual issues.
 Breakpoint: {width}px
-Context: {what changed, what page this is}
+Context: {what the developer changed, what page this is}
 
-Check for:
-- Alignment and spacing consistency
-- Overflow or clipping
-- Text readability and truncation
-- Visual hierarchy — does the important content stand out?
-- Responsive layout — does this look intentional at this breakpoint?
+Evaluate ONLY for:
+1. Does any content overflow or clip beyond the viewport edge?
+2. Is any text truncated or overlapping other elements?
+3. Are interactive elements (buttons, inputs) at least 44px tall for touch targets?
+4. Is the vertical spacing between sections consistent?
+5. Does the layout look intentional at this breakpoint, or broken?
 
-Report issues as a JSON array with: description, severity (critical/warning/info), location (top-left/center/etc.)
+For each issue, report:
+- WHAT: specific element description (e.g., "the Save button in the bottom-right")
+- WHERE: quadrant of the screen (top-left, center, bottom-right, etc.)
+- SEVERITY: critical (broken/unusable), warning (ugly but functional), info (minor polish)
+- SUGGESTION: one-line fix recommendation
+
+Response format (JSON):
+{
+  "status": "pass" | "fail",
+  "issues": [
+    {
+      "what": "string",
+      "where": "string",
+      "severity": "critical" | "warning" | "info",
+      "suggestion": "string"
+    }
+  ],
+  "summary": "one-line overall assessment"
+}
 ```
 
 **For video clips:**
 ```
 You are evaluating a UI interaction video for visual issues.
 Interaction: {what happens in this clip}
-Context: {what changed, what page this is}
+Context: {what the developer changed, what page this is}
 
 Watch for:
 - Layout shifts or content pushing during the interaction
@@ -151,28 +173,96 @@ Watch for:
 - Overflow or clipping that appears during state change
 - Anything that looks visually broken during the motion
 
-Report issues as a JSON array with: description, severity, timestamp (when in the clip it occurs)
+Response format (JSON):
+{
+  "status": "pass" | "fail",
+  "issues": [
+    {
+      "what": "string",
+      "where": "string",
+      "severity": "critical" | "warning" | "info",
+      "suggestion": "string",
+      "timestamp": "1.2s"
+    }
+  ],
+  "summary": "one-line overall assessment"
+}
 ```
+
+### Before/After Comparison Mode
+
+Sending two screenshots (before and after a change) dramatically improves issue detection. The model is much better at spotting regressions when it has both states to compare:
+
+```
+Image 1: the page BEFORE the change (reference).
+Image 2: the page AFTER the change (current).
+Identify any visual regressions introduced by the change.
+```
+
+At 258 tokens per optimized image, a before/after pair costs 516 tokens — negligible. This should be the default mode for screenshot evaluation when a reference capture exists.
 
 **TBD:**
 - How to inject project-specific style standards into prompts?
-- Should there be a "reference" mode where you show a known-good capture alongside the new one?
-- What's the right output format? Structured JSON? Free text? Both?
+- When/how to capture and store reference screenshots for comparison?
+- Gemini 3 models support per-part `media_resolution` — should reference images use LOW and the current image use HIGH?
 
 ---
 
-## Cost Estimates
+## Gemini Tokenization & Cost Optimization
 
-Based on Gemini 2.5 pricing (March 2026):
+Understanding how Gemini counts tokens is critical for keeping costs low.
 
-| Capture Type | Estimated Tokens | Estimated Cost |
-|---|---|---|
-| Single screenshot (720p, compressed) | ~1,500-3,000 | ~$0.002-0.004 |
-| 4 breakpoint screenshots | ~6,000-12,000 | ~$0.008-0.015 |
-| 2-second video clip (720p, 15fps) | ~15,000-30,000 | ~$0.02-0.04 |
-| Full QA pass (4 screenshots + 3 clips) | ~60,000-100,000 | ~$0.08-0.13 |
+### How Gemini Tokenizes Media
 
-**TBD:** These are rough estimates. Need to verify actual token counts for video input with Gemini's API.
+**Images:**
+- Both dimensions <= 384px → **258 tokens** (flat rate, single tile)
+- Larger images → cropped into **768x768 tiles**, each tile = **258 tokens**
+- A raw 1440x900 screenshot ≈ 4 tiles ≈ 1,032 tokens
+- A 768x768 image = 1 tile = 258 tokens (the sweet spot)
+
+**Video:**
+- **263 tokens per second** (fixed rate — resolution does NOT affect token count)
+- A 2-second clip = 526 tokens regardless of whether it's 480p or 1080p
+- Only duration matters for video cost
+
+**Gemini 3 models** add a `media_resolution` parameter (low/medium/high/ultra_high) that can be set per-part within a single request.
+
+### Optimization Rules (Implemented in `server/src/processing/optimize.ts`)
+
+**Screenshots — downscale to single-tile sweet spot:**
+
+| Strategy | Resolution | Tokens | vs. Raw |
+|---|---|---|---|
+| Raw 1440p capture | ~2560x1440 | ~3,096 (12 tiles) | baseline |
+| Downscale to 768px wide | 768x~432 | 258 (1 tile) | **92% cheaper** |
+| Downscale to 1024x768 | 1024x768 | 516 (2 tiles) | 83% cheaper |
+
+Rule: **always downscale screenshots to fit within 768x768 before sending to Gemini.** For UI evaluation (layout, spacing, alignment), this resolution is sufficient. Capture at full resolution for the file on disk, downscale only for the API call.
+
+**Video — keep clips short, don't reduce resolution:**
+- Resolution has zero effect on token cost for video
+- Send 720p for better evaluation quality — it's free
+- The only lever is duration: every second = 263 tokens
+- 1-3 second clips are the target
+
+**Format:**
+- **JPEG quality 80 for screenshots** — smaller upload, faster transfer, no perceptible quality loss for vision evaluation. Never send PNG to the API (lossless is wasted on vision input).
+- **MP4 H.264 for video** — standard, well-supported. Low bitrate is fine for UI content (low motion complexity).
+
+### Actual Cost Estimates
+
+Based on Gemini 2.5 pricing ($1.25/M input tokens for Pro, $0.30/M for Flash):
+
+| Capture Type | Tokens (Optimized) | Cost (Flash) | Cost (Pro) |
+|---|---|---|---|
+| Single screenshot (768px, JPEG) | 258 | $0.00008 | $0.0003 |
+| 4 breakpoint screenshots | 1,032 | $0.0003 | $0.001 |
+| Before/after screenshot pair | 516 | $0.00015 | $0.0006 |
+| 2-second video clip | 526 | $0.00016 | $0.0007 |
+| 3-second video clip | 789 | $0.00024 | $0.001 |
+| Full QA pass (4 screenshots + 3 video clips + before/after) | ~3,100 | $0.001 | $0.004 |
+
+A full QA pass costs under a penny. During development, even aggressive testing (50 full passes in a session) stays under $0.20.
 
 ---
 

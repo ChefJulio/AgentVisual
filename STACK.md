@@ -103,12 +103,14 @@ capture/
 ### CLI Interface
 
 ```
-agentvisual-capture screenshot --window <title|pid> [--output path.png] [--scale 0.5]
+agentvisual-capture screenshot --window <title|pid> [--output path.png] [--scale 0.5] [--format png|jpeg]
 agentvisual-capture record --window <title|pid> --duration <seconds> [--fps 15] [--output path.mp4] [--scale 0.5]
 agentvisual-capture list-windows [--json]
 ```
 
 All output defaults to a temp directory. JSON output on stdout for metadata (dimensions, file path, duration, etc.).
+
+**Capture output format:** The Rust binary always captures at full native resolution (DPI-aware). Downscaling for the vision API happens in the TypeScript layer via sharp — this keeps the Rust binary simple and lets us keep a full-resolution copy on disk while sending an optimized version to Gemini. The `--scale` flag is for cases where even the disk copy should be smaller.
 
 ---
 
@@ -127,7 +129,7 @@ All output defaults to a temp directory. JSON output on stdout for metadata (dim
 |---------|---------|---------|-------|
 | `@modelcontextprotocol/sdk` | ^1.27.0 | MCP server framework | Stdio transport. Same version as overtooled-mcp. |
 | `zod` | ^3.23.0 | Input validation | Schema validation for tool parameters. |
-| `sharp` | ^0.33.0 | Image processing | Resize/compress screenshots before sending to vision API. Proven in overtooled-mcp. |
+| `sharp` | ^0.33.0 | Image processing | Resize/compress screenshots before sending to vision API. Proven in overtooled-mcp. See "Image Optimization Pipeline" below. |
 
 ### Vision API Client
 
@@ -151,6 +153,22 @@ All output defaults to a temp directory. JSON output on stdout for metadata (dim
 | `typescript` | ^5.5.0 | Compiler |
 | `vitest` | ^2.0.0 | Testing |
 | `@types/node` | ^20 | Node.js type definitions |
+
+### Image Optimization Pipeline
+
+`server/src/processing/optimize.ts` — the critical layer between capture and vision API.
+
+Gemini tokenizes images by tiling them into 768x768 chunks at 258 tokens per tile. A raw 1440p screenshot costs ~3,096 tokens (12 tiles). Downscaled to fit within 768x768, it costs 258 tokens (1 tile) — **92% cheaper** with no meaningful loss for UI evaluation.
+
+**Processing steps (sharp):**
+1. **Read** the full-resolution PNG from the Rust binary
+2. **Resize** to fit within 768x768 (maintain aspect ratio, `sharp.resize({ width: 768, height: 768, fit: 'inside' })`)
+3. **Convert** to JPEG quality 80 (smaller file, faster upload — lossless PNG is wasted on vision API input)
+4. **Output** the optimized buffer for API upload
+
+The full-resolution original stays on disk untouched. Only the API payload is optimized.
+
+**For video:** No image optimization needed. Gemini tokenizes video at a flat 263 tokens/second regardless of resolution. Send 720p for best evaluation quality — it costs the same as 480p. Only clip duration affects cost.
 
 ### Intentionally NOT Including
 
@@ -322,10 +340,11 @@ What to build first, in order. Each layer is usable before the next one starts:
 
 ### Layer 2: TypeScript MCP Server — Screenshot Tool
 - MCP server with `screenshot()` tool
-- Spawns Rust binary, collects output
-- Sharp compression/resize of captures
-- Gemini Flash API call with screenshot evaluation prompt
-- Returns structured JSON findings
+- Spawns Rust binary, collects full-resolution PNG
+- Sharp optimization: resize to 768x768 max, JPEG quality 80 (258 tokens per image vs ~3,000 raw)
+- Gemini Flash API call with structured evaluation prompt + JSON response schema
+- Before/after comparison mode when reference capture exists (516 tokens for the pair)
+- Returns structured JSON findings to agent
 
 ### Layer 3: Rust CLI — Video Recording
 - `agentvisual-capture record --window "title" --duration 2s --fps 15 --output path.mp4`
@@ -334,8 +353,8 @@ What to build first, in order. Each layer is usable before the next one starts:
 
 ### Layer 4: TypeScript MCP Server — Video Tool
 - MCP `record()` tool
-- Gemini Pro API call with video evaluation prompt
-- Timestamped observations in response
+- Send 720p clips directly to Gemini Pro (resolution doesn't affect token cost for video — only duration does, at 263 tokens/sec)
+- Video evaluation prompt with JSON response schema + timestamped observations
 
 ### Layer 5: Evaluate Tool & Refinement
 - `evaluate()` tool for re-running vision on existing captures
