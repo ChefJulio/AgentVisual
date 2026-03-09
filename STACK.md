@@ -57,7 +57,7 @@ macOS VideoToolbox encoding uses Objective-C FFI bridge (compiled via `cc` build
 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
-| `clap` | CLI argument parsing | QuickShotter used Tauri IPC. AgentVisual needs a proper CLI. **TBD: version — likely 4.x** |
+| `clap` | 4.x | CLI argument parsing | QuickShotter used Tauri IPC. AgentVisual needs a proper CLI. |
 
 ### Removed from QuickShotter
 
@@ -135,16 +135,15 @@ All output defaults to a temp directory. JSON output on stdout for metadata (dim
 
 | Package | Version | Purpose | Notes |
 |---------|---------|---------|-------|
-| `@google/generative-ai` | **TBD** | Gemini API client | Official Google SDK for Gemini. Handles video + image input natively. **Need to verify current version and video input support.** |
+| `@google/generative-ai` | ^0.24.0 | Gemini API client | Official Google SDK for Gemini. Supports inline image data and File API for video upload. |
 
-**TBD: Gemini SDK specifics:**
-- Does `@google/generative-ai` support video file upload directly, or does it need to go through the File API first?
-- What's the max video duration/size for a single API call?
-- Is there a streaming response option for faster feedback on larger evaluations?
+**Gemini SDK notes:**
+- Images: send as inline base64 data (no File API needed for optimized screenshots — they're small after Sharp processing).
+- Video: upload via File API first (`fileManager.uploadFile()`), then reference in the prompt. Required for files > 20MB or for video input.
+- Max video: 1 hour or 2GB per file via File API. Our clips are 1-3 seconds — well within limits.
+- Streaming: `generateContentStream()` available. Worth using for video evaluation where response may be longer. Not needed for screenshot evaluation (responses are small).
 
-**TBD: Multi-model support:**
-- Should we abstract the vision API behind an interface to support Claude (images) and Gemini (video) interchangeably?
-- Or start Gemini-only and add others later?
+**Multi-model support:** Abstract behind a `VisionClient` interface from day one. Start with Gemini implementation only, but the interface makes adding Claude (images) or future video-capable models a new implementation, not a refactor. The interface is simple: `evaluate(media: Buffer | string, prompt: string) => EvaluationResult`.
 
 ### Dev Dependencies
 
@@ -227,10 +226,7 @@ AgentVisual/
     └── src/
 ```
 
-**TBD: Monorepo tooling:**
-- Do we need a workspace-level build script that builds both?
-- Or keep them independent — `cd capture && cargo build` / `cd server && npm run build`?
-- How does the TypeScript server locate the Rust binary? Bundled? Expect it on PATH? Configurable path in env?
+**Decision: Independent builds, no monorepo tooling.** `cd capture && cargo build` / `cd server && npm run build`. A workspace-level build script adds complexity for zero benefit when there are only two components. The TypeScript server locates the Rust binary via: (1) `AGENTVISUAL_CAPTURE_BIN` env var if set, (2) `agentvisual-capture` on PATH otherwise. No bundling — the binary is a separate install.
 
 ---
 
@@ -263,7 +259,7 @@ Optional file in project root for project-specific defaults:
 }
 ```
 
-**TBD:** Is this needed for MVP, or is it Phase 3 refinement?
+**Phase 3 refinement.** Not needed for MVP. Defaults are sufficient until real usage reveals what needs to be configurable.
 
 ---
 
@@ -292,14 +288,14 @@ npm install
 npm run build
 ```
 
-**Distribution options (TBD):**
-- `npx agentvisual` — like overtooled-mcp, published to npm
-- But the Rust binary needs to come from somewhere. Options:
-  1. Ship prebuilt binaries as npm optionalDependencies (platform-specific packages, like `esbuild` does)
-  2. Expect user to build from source or download binary separately
-  3. GitHub Releases with platform binaries, npm package downloads on first run
+**Distribution: GitHub Releases + npm postinstall download (Option 3).**
 
-**TBD:** This is a significant distribution decision. Option 1 is the smoothest UX but most complex to set up. Option 2 is simplest but highest friction. Option 3 is a middle ground.
+npm package published as `agentvisual`. On `npm install` (or `npx`), a postinstall script downloads the correct prebuilt Rust binary from the matching GitHub Release for the user's platform/arch. Same pattern as `esbuild` but simpler — one binary, not a platform-specific npm package per target.
+
+Why not Option 1 (platform-specific npm packages): Complex to set up and maintain. Not worth it until there's significant adoption.
+Why not Option 2 (build from source): Too much friction. Users shouldn't need a Rust toolchain to use an MCP server.
+
+For development: build locally with `cargo build --release`. The postinstall download is only for published releases.
 
 ---
 

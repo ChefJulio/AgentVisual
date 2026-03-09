@@ -23,7 +23,7 @@ evaluate(files[], prompt?)
   - Returns: structured observations
 ```
 
-**TBD:** Should there be higher-level composite tools? E.g., `qa_pass(window)` that automatically runs screenshots at multiple breakpoints + interaction clips and returns a full report? Or keep it primitive and let the agent compose?
+**Decision: Keep it primitive.** Let the agent compose `screenshot()` and `record()` calls as needed. A composite `qa_pass()` tool bakes in assumptions about what "a full QA pass" means — which varies by project, by change, and by context. The agent is better positioned to decide what to check. If a common pattern emerges from real usage, a composite tool can be added later without breaking the primitives.
 
 ---
 
@@ -100,9 +100,9 @@ QuickShotter is a Tauri GUI app. AgentVisual needs a **headless CLI binary** tha
 - Add: capture by window title or window handle (not just cursor position)
 - Add: configurable output resolution (downscale for token efficiency)
 
-**TBD:**
-- Should the Rust binary be a long-running daemon (IPC) or invoked per-capture (CLI)? CLI is simpler, daemon avoids startup cost for rapid successive captures.
-- How to handle window targeting cross-platform? Title match? PID? Window class? All of the above?
+**Decision: CLI, not daemon.** Invoked per-capture. Startup cost is negligible for a native binary (< 50ms), and it eliminates an entire class of problems: process lifecycle, IPC protocol, crash recovery, zombie processes. If startup cost ever becomes a bottleneck (unlikely — the vision API call dominates latency), a daemon can be added later without changing the TypeScript bridge interface.
+
+**Window targeting:** Title substring match is the primary method (cross-platform, human-readable). PID as secondary for disambiguation when multiple windows share a title. Window class/handle as platform-specific fallback. `list-windows` returns all three so the agent can pick the right identifier.
 
 ---
 
@@ -116,7 +116,7 @@ QuickShotter is a Tauri GUI app. AgentVisual needs a **headless CLI binary** tha
 | Screenshots (cost-sensitive) | Gemini 2.5 Flash | Cheaper, still good image understanding |
 | Screenshots (quality) | Claude or Gemini Pro | Strong image reasoning |
 
-**TBD:** Should the model be user-configurable? Or should AgentVisual pick the best model per task automatically?
+**Decision: Automatic by default, overridable.** The server picks the best model per task (Flash for screenshots, Pro for video) unless the user overrides via `AGENTVISUAL_MODEL` env var or `.agentvisual.json` config (Phase 3). The vision client interface abstracts the provider so adding new models (Claude for images, future video-capable models) is a client implementation swap, not an architecture change.
 
 ### Evaluation Prompts
 
@@ -201,10 +201,10 @@ Identify any visual regressions introduced by the change.
 
 At 258 tokens per optimized image, a before/after pair costs 516 tokens — negligible. This should be the default mode for screenshot evaluation when a reference capture exists.
 
-**TBD:**
-- How to inject project-specific style standards into prompts?
-- When/how to capture and store reference screenshots for comparison?
-- Gemini 3 models support per-part `media_resolution` — should reference images use LOW and the current image use HIGH?
+**Decided:**
+- Project-specific style standards injected via Layer 3 of the prompt architecture (see "Prompt Architecture" section below). Loaded from `.agentvisual.json` `styleGuide` field.
+- Reference screenshots are automatic — the server tracks `lastCapture` per window in session state. No explicit "store reference" step needed. The previous capture IS the reference.
+- Gemini 3 `media_resolution`: use HIGH for the current image (what we're evaluating) and LOW for the reference (just needs enough detail for comparison). This keeps the pair cost-efficient while maximizing evaluation quality on the thing that matters.
 
 ---
 
@@ -293,10 +293,240 @@ Developer: "The spacing on mobile is fine, ignore that"
 Agent adjusts and continues
 ```
 
-**TBD:**
-- Does the agent need to know the dev server URL, or can AgentVisual auto-detect running dev servers?
-- For non-browser apps, how does the agent specify which window to capture? By title? By process name?
-- Should there be a `.agentvisual.json` config file in the project root with defaults (window title patterns, breakpoints, known-good reference captures)?
+**Decided:**
+- AgentVisual captures windows, not URLs. The agent specifies a window title (or PID). It doesn't need to know how the app is served — just what the window is called. `list-windows` lets the agent discover available windows.
+- For non-browser apps, same mechanism: window title or PID. All applications have a window title.
+- `.agentvisual.json` is Phase 3. Not needed for MVP. The defaults (768px optimization, JPEG quality 80, Gemini Flash for screenshots) are good enough. Project config adds value once users want custom breakpoints, style guide injection, or model overrides.
+
+---
+
+## Cross-Process Contracts
+
+The boundary between the Rust binary and the TypeScript server is the hardest thing to change once both sides are built. These schemas are the API — treat them as load-bearing.
+
+### Rust CLI → TypeScript: Stdout JSON Schemas
+
+Every command outputs exactly one JSON object on stdout. Stderr is reserved for logs/errors.
+
+**`screenshot` output:**
+```json
+{
+  "command": "screenshot",
+  "success": true,
+  "file": "/tmp/agentvisual/shot-2026-03-09T17-23-01.png",
+  "window": {
+    "title": "My App - localhost:5173",
+    "pid": 12345,
+    "width": 1920,
+    "height": 1080
+  },
+  "capture": {
+    "width": 1920,
+    "height": 1080,
+    "scale": 1.0,
+    "format": "png",
+    "bytes": 245760
+  }
+}
+```
+
+**`record` output:**
+```json
+{
+  "command": "record",
+  "success": true,
+  "file": "/tmp/agentvisual/clip-2026-03-09T17-23-01.mp4",
+  "window": {
+    "title": "My App - localhost:5173",
+    "pid": 12345,
+    "width": 1920,
+    "height": 1080
+  },
+  "recording": {
+    "width": 1920,
+    "height": 1080,
+    "scale": 1.0,
+    "fps": 15,
+    "duration_ms": 2000,
+    "frames": 30,
+    "encoder": "media_foundation" | "videotoolbox" | "openh264",
+    "format": "mp4",
+    "bytes": 512000
+  }
+}
+```
+
+**`list-windows` output:**
+```json
+{
+  "command": "list-windows",
+  "success": true,
+  "windows": [
+    {
+      "title": "My App - localhost:5173",
+      "pid": 12345,
+      "width": 1920,
+      "height": 1080,
+      "visible": true
+    }
+  ]
+}
+```
+
+**Error output (any command):**
+```json
+{
+  "command": "screenshot",
+  "success": false,
+  "error": {
+    "code": "window_not_found",
+    "message": "No window matching 'My App' found"
+  }
+}
+```
+
+### Error Taxonomy
+
+Errors are categorized so the TypeScript server (and ultimately the calling agent) can make decisions based on the error type, not parse human-readable strings.
+
+**Rust binary error codes:**
+
+| Code | Meaning | Agent can retry? |
+|------|---------|-----------------|
+| `window_not_found` | No window matches the given title/PID | No — agent should check window title or call `list-windows` |
+| `window_minimized` | Window exists but is minimized/hidden — can't capture pixels | No — agent should note this and skip or ask user |
+| `capture_failed` | OS screen capture API returned an error | Maybe — transient OS issue, one retry reasonable |
+| `encoding_failed` | Video encoder crashed or produced invalid output | Maybe — will fall back to CPU encoder automatically, but if CPU also fails, no |
+| `io_error` | Couldn't write output file (disk full, permissions) | No — system issue |
+| `invalid_args` | Bad CLI arguments | No — caller bug |
+
+**TypeScript server error codes (returned to agent via MCP):**
+
+| Code | Meaning |
+|------|---------|
+| `binary_not_found` | Rust binary not on PATH and `AGENTVISUAL_CAPTURE_BIN` not set |
+| `binary_crashed` | Rust process exited non-zero with unparseable output |
+| `window_not_found` | Passthrough from Rust binary |
+| `window_minimized` | Passthrough from Rust binary |
+| `capture_failed` | Passthrough from Rust binary |
+| `optimization_failed` | Sharp image processing failed (corrupt image?) |
+| `vision_api_error` | Gemini API returned an error (auth, rate limit, malformed response) |
+| `vision_api_timeout` | Gemini API didn't respond within timeout |
+
+Every MCP error response includes `code` + human-readable `message`. The agent can branch on `code`; the `message` is for logging.
+
+---
+
+## State Management
+
+### Decision: Session-Scoped State
+
+The MCP server maintains lightweight state for the duration of the MCP connection (one agent session). This enables before/after comparison without the agent managing file paths.
+
+**What's tracked per session:**
+- `lastCapture: { file: string, window: string, timestamp: number }` — the most recent screenshot or recording. Enables "compare with previous" mode automatically.
+- `captures: Map<string, CaptureRecord>` — all captures in this session, keyed by auto-generated ID. Enables `evaluate()` to reference previous captures by ID.
+
+**What's NOT tracked:**
+- Nothing persists across MCP connections. When the agent disconnects, session state is gone.
+- No database, no files for state. Pure in-memory.
+
+**Why session-scoped:**
+- Stateless (agent manages paths) is simple but makes before/after comparison clunky — the agent has to track and pass file paths for every comparison.
+- Persistent state (across sessions) adds complexity with no clear benefit — captures from a previous session are stale.
+- Session-scoped hits the sweet spot: automatic before/after within a working session, no cleanup problem, no persistence overhead.
+
+**How before/after works:**
+1. Agent calls `screenshot("My App")` — server captures, stores as `lastCapture`, evaluates, returns results.
+2. Agent makes a code change.
+3. Agent calls `screenshot("My App")` again — server captures new screenshot, sends both previous + current to vision model in comparison mode, updates `lastCapture`.
+4. Agent gets results that highlight regressions between the two states.
+
+The agent doesn't need to know this is happening. It just calls `screenshot()` and gets smarter results when a previous capture exists for the same window.
+
+**Override:** The agent can pass `compare: false` to skip comparison, or `compare_with: "<capture_id>"` to compare against a specific earlier capture instead of the most recent one.
+
+---
+
+## File Lifecycle
+
+### Decision: Session-Scoped with Automatic Cleanup
+
+Capture files live in a session-specific temp directory and are cleaned up when the MCP connection closes.
+
+**Structure:**
+```
+$AGENTVISUAL_TEMP_DIR/          (default: OS temp dir)
+  └── session-<uuid>/
+      ├── shot-001.png          Full-resolution original
+      ├── shot-001-opt.jpg      Optimized version sent to vision API
+      ├── clip-002.mp4          Video recording
+      └── ...
+```
+
+**Lifecycle:**
+1. **On MCP connection open** — create `session-<uuid>/` directory.
+2. **On each capture** — Rust binary writes to session directory. TypeScript writes optimized copies alongside.
+3. **On MCP connection close** — delete the entire `session-<uuid>/` directory.
+4. **Crash safety** — on server startup, scan for orphaned `session-*` directories older than 1 hour and delete them.
+
+**Why not let the agent manage cleanup:**
+- Agents crash. Files leak. Temp directories fill up.
+- The agent has no reason to keep captures after the session — they're stale.
+- Automatic cleanup means zero maintenance.
+
+**Escape hatch:** If the agent wants to keep a capture, it can copy the file to a permanent location. The MCP response includes the file path. But by default, captures are ephemeral.
+
+---
+
+## Prompt Architecture
+
+### Decision: Layered and File-Loaded
+
+Evaluation prompts are the core value of the project. They'll be iterated constantly. The architecture must support rapid iteration without rebuilds, while still allowing programmatic composition.
+
+**Three layers, composed at evaluation time:**
+
+```
+┌─────────────────────────────────┐
+│  Layer 1: Base prompt           │  Built-in. Defines the evaluation framework,
+│  (what to look for, how to      │  output JSON schema, severity definitions.
+│  report it)                     │  Changes rarely. Lives in source code.
+├─────────────────────────────────┤
+│  Layer 2: Capture context       │  Auto-generated per call. Breakpoint width,
+│  (what was captured, what       │  window title, what the agent said it changed,
+│  changed)                       │  comparison mode (before/after).
+├─────────────────────────────────┤
+│  Layer 3: Project style guide   │  Optional. Loaded from `.agentvisual.json`
+│  (project-specific standards)   │  if present. E.g., "this project uses 8px
+│                                 │  spacing grid" or "dark theme, no white bg".
+└─────────────────────────────────┘
+```
+
+**Layer 1 (base prompts)** lives in `server/src/vision/prompts/` as `.txt` files, loaded at startup:
+- `screenshot-eval.txt` — base screenshot evaluation prompt
+- `video-eval.txt` — base video evaluation prompt
+- `comparison-eval.txt` — before/after comparison prompt
+
+Why `.txt` files instead of hardcoded template literals:
+- Editable without recompiling TypeScript
+- Diffable in git — prompt changes are visible in commit history
+- No risk of breaking code syntax while editing prose
+
+**Layer 2 (capture context)** is injected programmatically by the tool handlers. Template variables in the base prompts (`{window_title}`, `{breakpoint}`, `{change_context}`) are replaced at call time.
+
+**Layer 3 (project style guide)** is optional text from `.agentvisual.json`:
+```json
+{
+  "styleGuide": "8px spacing grid. Dark theme only. Minimum touch target 48px. Font sizes: 14px body, 18px headings."
+}
+```
+
+If present, this text is appended to the base prompt. If absent, the prompt works without it.
+
+**Why not a single hardcoded template:**
+- Hardcoded prompts require a rebuild to iterate. During early development, prompt tuning will be the most frequent change.
+- But fully dynamic prompts (loaded from user config) lose version control. The layered approach keeps the base prompts versioned in source while allowing project-specific additions.
 
 ---
 
@@ -304,28 +534,39 @@ Agent adjusts and continues
 
 ### Inputs (from coding agent to AgentVisual)
 
-- **Window identifier** — title, process name, or handle
+- **Window identifier** — title (substring match), process name, or PID
 - **Capture type** — screenshot or video
 - **Duration** (video only) — how long to record
 - **Options** — FPS, resolution, breakpoints, format
 - **Context** (optional) — what changed, what to focus on, custom evaluation prompt
+- **Comparison** (optional) — `compare: false` to skip auto-comparison, `compare_with: "<id>"` to compare against a specific earlier capture
 
 ### Outputs (from AgentVisual back to coding agent)
 
-- **File paths** — captured screenshots/video clips saved to temp directory
-- **Evaluation results** — structured JSON with:
-  - `status`: "pass" | "issues_found"
-  - `issues[]`: array of findings
-    - `description`: what's wrong
-    - `severity`: "critical" | "warning" | "info"
-    - `timestamp` (video only): when in the clip
-    - `location`: where on screen (rough quadrant or coordinates)
-  - `summary`: one-line overall assessment
-
-**TBD:**
-- Should AgentVisual clean up temp files automatically, or let the agent manage them?
-- Should captured media be base64-encoded in the MCP response, or returned as file paths?
-- Max file size / clip duration limits?
+- **Capture ID** — session-scoped identifier for referencing this capture later
+- **File path** — full path to captured file (in session temp directory)
+- **Evaluation results** — structured JSON:
+  ```json
+  {
+    "status": "pass" | "fail",
+    "issues": [
+      {
+        "what": "description of the issue",
+        "where": "location on screen (quadrant or description)",
+        "severity": "critical" | "warning" | "info",
+        "suggestion": "one-line fix recommendation",
+        "timestamp": "1.2s"
+      }
+    ],
+    "summary": "one-line overall assessment",
+    "comparison": {
+      "reference_id": "capture-001",
+      "regressions": 2,
+      "improvements": 1
+    }
+  }
+  ```
+- **Error** (on failure) — `{ "code": "...", "message": "..." }` using the error taxonomy above
 
 ---
 
@@ -375,4 +616,4 @@ Agent adjusts and continues
 - Reference/comparison mode (before vs. after)
 - Prompt tuning based on real-world usage
 
-**TBD:** Timeline, priority of features within each phase, what counts as "done" for Phase 1.
+**Phase 1 is "done" when:** An agent can call `screenshot("window title")` via MCP, get back a structured JSON evaluation with actionable findings, and the full pipeline works end-to-end (Rust capture -> Sharp optimization -> Gemini evaluation -> MCP response). Before/after comparison working. Error handling returns structured codes, not crashes.
