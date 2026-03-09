@@ -2,13 +2,13 @@
 
 ## Mission
 
-Give AI coding agents video-based visual perception of their own UI output — not screenshots, not pixel diffs, but actual video of the interface in motion — so they can catch the problems that only reveal themselves through interaction and movement.
+Give AI coding agents visual perception of their own UI output — through both automated screenshots and targeted video capture — so they can catch layout issues, styling bugs, and the interaction-driven problems that only reveal themselves in motion.
 
 ## The Problem
 
 AI coding assistants are blind. They write CSS, build layouts, wire up animations — and have zero idea what any of it actually looks like. The current workaround is the human: you look at the screen, notice something's off, screenshot it, describe it, feed it back. You are the visual cortex.
 
-Screenshots help, but they miss an entire class of bugs that only exist in motion:
+Screenshots catch a lot — broken layouts, alignment issues, overflow, spacing problems at specific breakpoints. They're cheap, fast, and effective for static visual QA. But they miss an entire class of bugs that only exist in motion:
 
 - Layout shifting when a button is clicked
 - Content pushing down on state change
@@ -22,7 +22,15 @@ These are **temporal, interaction-driven problems**. A static image can't captur
 
 ## The Solution
 
-Short, targeted video recordings of UI interactions, fed to a vision-capable LLM for evaluation.
+Two modes of visual evaluation, used together:
+
+### Screenshots (Fast, Cheap, Static)
+
+Automated screenshots at key breakpoints and states — the baseline QA pass. Catches alignment, spacing, overflow, clipping, and layout issues. Cheap enough to run on every change.
+
+### Video (Targeted, Temporal, Motion-Aware)
+
+The headline capability. Short, targeted video recordings of UI interactions, fed to a vision-capable LLM for evaluation.
 
 Not continuous screen recording. Not a stream. **Precise clips** — record only the window of time needed to capture the interaction being tested:
 
@@ -33,34 +41,36 @@ Not continuous screen recording. Not a stream. **Precise clips** — record only
 
 Trim it tight, keep resolution and framerate sane (720p, 15-30fps is plenty for UI evaluation), and send the clip to a vision model that can watch it and say: "At 1.2 seconds, the sidebar collapses and pushes the main content down by 40px before snapping back. That's a layout shift bug."
 
+The natural workflow is escalation: run the cheap screenshot pass first, and if something looks off or the change involves interaction/animation, trigger targeted video clips to evaluate the motion.
+
 ## What This Is NOT
 
-- Not a screenshot tool (Claude Code already does that)
 - Not a pixel-diff regression framework (Playwright/Cypress do that)
 - Not continuous screen recording (too expensive, too noisy)
 - Not a browser automation agent (Computer Use drives the mouse — this watches the result)
 
 ## What This IS
 
-A **video-based visual QA layer** for AI coding loops. The AI writes code, the UI renders, AgentVisual records targeted interaction clips, and the vision model evaluates what it sees — catching the temporal, motion-based problems that no amount of code reading or screenshot analysis can detect.
+A **visual QA layer** for AI coding loops. Screenshots for fast static checks, video for interaction and motion evaluation. The AI writes code, the UI renders, AgentVisual captures what it needs to — stills or clips — and the vision model evaluates what it sees, catching problems that code analysis alone can never detect.
 
 ## Core Concept
 
 ```
 Code change (AI or human)
   --> UI hot reloads
-  --> AgentVisual triggers targeted recordings:
+  --> Screenshot pass (fast, cheap):
+        capture at 320px, 768px, 1024px, 1440px
+        capture key interactive states (modal open, dropdown expanded, etc.)
+        send to vision model for static evaluation
+  --> Video pass (targeted, when needed):
         record: resize from desktop to mobile (3s clip)
         record: click primary action button (1s clip)
         record: open/close modal (2s clip)
         record: scroll full page (2s clip)
         record: hover interactive elements (1s clip each)
-  --> trim clips tight, encode at 720p / 15-30fps
-  --> send to vision model with context:
-        "Watch this clip. Evaluate for layout shifts, reflow,
-         animation jank, overflow, clipping, or anything that
-         looks visually broken during the interaction."
-  --> model returns timestamped observations
+        trim clips tight, encode at 720p / 15-30fps
+        send to vision model for motion evaluation
+  --> model returns observations (with timestamps for video)
   --> feed back into coding loop for fixes
 ```
 
@@ -89,8 +99,8 @@ The goal is clips measured in seconds and megabytes, not minutes and gigabytes.
 An AI coding agent can:
 
 1. Make a UI change
-2. AgentVisual automatically records targeted interaction clips
-3. The vision model watches the clips and identifies motion-based visual bugs
+2. AgentVisual automatically captures screenshots and/or targeted video clips
+3. The vision model evaluates stills for static issues, video for motion-based bugs
 4. The agent fixes them without a human ever opening a browser
 5. The human only intervenes for design decisions — not for catching a div that pushes content around when clicked
 
